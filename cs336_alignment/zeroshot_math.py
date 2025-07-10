@@ -109,6 +109,7 @@ def evaluate_math(
     print(f"Average Answer Reward: {sum_answer_reward / len(rewards):.4f}")
     print(f"Average Total Reward: {sum_reward / len(rewards):.4f}")
     print("-" * 50)
+    
     return rewards
 
 def main():

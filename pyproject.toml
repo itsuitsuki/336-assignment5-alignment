@@ -28,7 +28,7 @@ include = ["cs336_alignment"]
 [tool.uv]
 package = true
 no-build-isolation-package = ["flash-attn"]
-
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 [tool.uv.sources]
 alpaca-eval = { git = "https://github.com/nelson-liu/alpaca_eval.git", rev = "forward_kwargs_to_vllm" }
@@ -41,3 +41,4 @@ log_cli_level = "WARNING"
 name = "flash-attn"
 version = "2.7.4.post1"
 requires-dist = ["torch", "einops", "setuptools"]
+

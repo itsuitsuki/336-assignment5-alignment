@@ -14,6 +14,12 @@ def test_tokenize_prompt_and_output(numpy_snapshot, prompt_strs, output_strs, to
         output_strs=output_strs,
         tokenizer=tokenizer,
     )
+    print("stu output: ", output)
+    # read test/_snapshots/test_tokenize_prompt_and_output.npz and print
+    import numpy as np
+    npy = np.load("tests/_snapshots/test_tokenize_prompt_and_output.npz")
+    # print(npy)
+    print("npy output: ", npy["input_ids"])
     numpy_snapshot.assert_match(output)
 
 def test_compute_entropy(numpy_snapshot, logits):

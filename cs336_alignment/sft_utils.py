@@ -1,7 +1,9 @@
+import json
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer, PreTrainedModel
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
+import re
 
 def naive_load_model_and_tokenizer():
     # qwen 2.5 math 1.5b
@@ -26,36 +28,32 @@ def demo_forward_pass(batch, model):
     
     
     print("loss: ", loss.item())
-    
-def load_math():
-    ds = load_dataset("DigitalLearningGmbH/MATH-lighteval", "default", streaming=False) # "train" and "test"
-    return ds
 
-def demo():
-    ds = load_math()["train"]
-    prompt = open("cs336_alignment/prompts/r1_zero.prompt", "r").read()
-    model, tokenizer = naive_load_model_and_tokenizer()
-    problem = next(iter(ds))["problem"]
-    prefill = prompt.format(question=problem)
-    dummy_response = "Yes. It's 42. </think>\n<answer>42</answer>"  # Dummy answer for demonstration
-    prefill_ids = tokenizer(prefill, return_tensors="pt").input_ids
-    response_ids = tokenizer(dummy_response, return_tensors="pt").input_ids
+# def demo():
+#     ds = load_math()["train"]
+#     prompt = open("cs336_alignment/prompts/r1_zero.prompt", "r").read()
+#     model, tokenizer = naive_load_model_and_tokenizer()
+#     problem = next(iter(ds))["problem"]
+#     prefill = prompt.format(question=problem)
+#     dummy_response = "Yes. It's 42. </think>\n<answer>42</answer>"  # Dummy answer for demonstration
+#     prefill_ids = tokenizer(prefill, return_tensors="pt").input_ids
+#     response_ids = tokenizer(dummy_response, return_tensors="pt").input_ids
 
-    # input_ids = tokenizer(model_input, return_tensors="pt").input_ids # pt means pytorch
-    input_ids = torch.cat([prefill_ids, response_ids], dim=1)  # Concatenate prefill and response
+#     # input_ids = tokenizer(model_input, return_tensors="pt").input_ids # pt means pytorch
+#     input_ids = torch.cat([prefill_ids, response_ids], dim=1)  # Concatenate prefill and response
 
-    # assert tokenizer(prefill + dummy_response, return_tensors="pt").input_ids.shape == input_ids.shape, "Input IDs do not match concatenated input."
-    # print("input ids:", input_ids)
-    # print("concat ids:", tokenizer(prefill + dummy_response, return_tensors="pt").input_ids)
-    labels = input_ids.clone() # labels are the same as input_ids for language modeling
-    # [:-1] and [1:]
-    input_ids = input_ids[:, :-1]  # remove last token
-    labels = labels[:, 1:]  # remove first token
+#     # assert tokenizer(prefill + dummy_response, return_tensors="pt").input_ids.shape == input_ids.shape, "Input IDs do not match concatenated input."
+#     # print("input ids:", input_ids)
+#     # print("concat ids:", tokenizer(prefill + dummy_response, return_tensors="pt").input_ids)
+#     labels = input_ids.clone() # labels are the same as input_ids for language modeling
+#     # [:-1] and [1:]
+#     input_ids = input_ids[:, :-1]  # remove last token
+#     labels = labels[:, 1:]  # remove first token
 
-    # forward pass
-    demo_forward_pass({"input_ids": input_ids, "labels": labels}, model)
+#     # forward pass
+#     demo_forward_pass({"input_ids": input_ids, "labels": labels}, model)
 
-def tokenizer_prompt_and_output(prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer):
+def tokenize_prompt_and_output(prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer):
     """
     prompt and output strings, and construct a mask that is 1 for the response tokens and 0 for other tokens (prompt or padding).
 
@@ -69,7 +67,6 @@ def tokenizer_prompt_and_output(prompt_strs: list[str], output_strs: list[str], 
         labels (torch.Tensor): shape (batch_size, max(prompt_and_output_lens)-1): the tokenized labels w/ the first token sliced off
         response_mask (torch.Tensor): shape (batch_size, max(prompt_and_output_lens)-1): 1 for response tokens, 0 for prompt or padding tokens
     """
-    
     tokenizer_out = tokenizer(prompt_strs, output_strs, return_tensors="pt", padding=True, truncation=True, add_special_tokens=True)
     # hand add eos token to the end of each output
     batch_size = tokenizer_out.input_ids.shape[0]
@@ -111,10 +108,10 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
         torch.Tensor: A tensor of shape (batch_size, sequence_length) containing the entropy for each token.
     """
     with torch.no_grad():
-        probs = F.softmax(logits.detach().cpu(), dim=-1)
+        probs = F.softmax(logits.detach().cpu(), dim=-1) # on cpu
         log_probs = torch.log(probs + 1e-10)  # Add a small value to avoid log(0)
         entropy = -torch.sum(probs * log_probs, dim=-1)
-        return entropy
+        return entropy # shape: (batch_size, sequence_length)
 
 def get_response_log_probs(model, input_ids: torch.Tensor, labels: torch.Tensor, return_token_entropy: bool = False) -> dict[str, torch.Tensor]:
     """
@@ -131,20 +128,22 @@ def get_response_log_probs(model, input_ids: torch.Tensor, labels: torch.Tensor,
             - "log_probs": Log probabilities of the response tokens.
             - "token_entropy": Entropy of the response tokens if requested.
     """
-    outputs = model(input_ids, labels=labels, output_hidden_states=False)
-    logits = outputs.logits  # shape (batch_size, sequence_length, vocab_size)
-    
+    logits = model.forward(input_ids, labels=labels, output_hidden_states=False).logits
+    result = {}
+    if return_token_entropy:
+        entropy = compute_entropy(logits)
+        # assert on cpu
+        # assert result["token_entropy"].device.type == "cpu"  
     # Get the log probabilities for the response tokens
     log_probs = F.log_softmax(logits, dim=-1)
+    del logits
     
     # Extract the log probabilities for the response tokens
     response_log_probs = log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)  # shape (batch_size, sequence_length)
-    
-    result = {"log_probs": response_log_probs}
-    
+    del log_probs
+    result["log_probs"] = response_log_probs
     if return_token_entropy:
-        result["token_entropy"] = compute_entropy(logits)
-    
+        result["token_entropy"] = entropy
     return result
 
 def masked_normalize(
@@ -154,7 +153,7 @@ def masked_normalize(
     dim: int | None = None,
 ) -> torch.Tensor:
     # sum and div by a const
-    # actually not normalizin'
+    # actually not normalizing
     
     # sum only respecting a mask w/ m=1
     if dim is None:
@@ -175,14 +174,17 @@ def sft_microbatch_train_step(
     # normalize_constant: float, constant to normalize the loss.
     
     # Compute the loss = masked sum of log probabilities
-    loss = masked_normalize(
-        tensor= -policy_log_probs,  # negative because we want to maximize the log probabilities
+    loss = -masked_normalize(
+        tensor=policy_log_probs,  # negative because we want to maximize the log probabilities
         mask=response_mask,
         normalize_constant=normalize_constant,
         dim=1,  # sum over all.
-    ) 
+    ) # shape (B, )
     # if dim=1 then # (B, ) where every element is the sum of log probabilities for the response tokens in one example.
-    loss = loss.mean()  # average over the batch
+
+    # n_effective_tokens = response_mask.sum()
+    # loss /= n_effective_tokens
+    loss = loss.mean()
     loss = loss / gradient_accumulation_steps  # average over the gradient accumulation steps
     
     loss.backward()  # Backpropagate the loss
@@ -228,39 +230,6 @@ def log_generations(
     """
     pass
 
-def filter_gsm8k_to_think_answer_format(
-    gsm8k_example,
-):
-    # find the last "####" pattern and change to </think> <answer>
-    # problem = gsm8k_example["question"]
-    solution = gsm8k_example["answer"]
-    import re
-    # replace the last occurrence of "####" with "</think> <answer>"
-    # the last "####" is in "#### 42abc" where 42abc is the answer and the pattern is the end of the answer.
-    # add boxed 
-    answer = re.sub(r"####\s*(.*)", r"</think> <answer>\\boxed{\1}</answer>", solution, count=1)
-    # add <think> at the beginning
-    answer = "<think> " + answer
-    return {
-        "problem": gsm8k_example["question"],
-        "solution": answer,
-        # "answer": answer,  # for compatibility with the original format
-    }
-
-def preprocess_gsm8k_dataset(
-    dataset,
-    shuffle: bool = True,
-    seed = 42,
-):
-    # filter w/ only w/ a sol
-    dataset = dataset.filter(lambda x: x["answer"] is not None)
-    # map to the think-answer format
-    dataset = dataset.map(filter_gsm8k_to_think_answer_format)
-    # shuffle?
-    if shuffle:
-        dataset = dataset.shuffle(seed=seed)
-    # return the processed dataset
-    return dataset
 
 def filter_dataset_by_answer_correctness(
     dataset,
@@ -278,12 +247,3 @@ def filter_dataset_by_answer_correctness(
     for example in dataset:
         answer = example["solution"]
         reward = reward_fn(answer)
-        
-    
-if __name__ == "__main__":
-    dataset = load_dataset("gsm8k", "main", split="train")
-    print("Dataset loaded with {} examples.".format(len(dataset)))
-    dataset = preprocess_gsm8k_dataset(dataset)
-    # print 2 examples
-    for i in range(2):
-        print("Example {}: {}".format(i, dataset[i]))

@@ -197,5 +197,5 @@ def grpo_microbatch_train_step(
     
     loss = masked_mean(loss, response_mask) / gradient_accumulation_steps
     loss.backward()
-    metadata["policy_log_probs_grad"] = policy_log_probs.grad
+    metadata["policy_log_probs_grad"] = policy_log_probs.retain_grad()
     return loss, metadata

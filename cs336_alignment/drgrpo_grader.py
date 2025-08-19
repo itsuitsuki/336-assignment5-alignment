@@ -1011,7 +1011,6 @@ def r1_zero_reward_fn(response, ground_truth, fast=True):
     think_n_answer_in_response = (response.split("</think>")[-1].split("<answer>")[0]).strip() == ""
     if think_n_answer_in_response and "</answer>" in response:
         model_answer = response.split("<answer>")[-1].replace("</answer>", "").strip()
-        # breakpoint()
         if "\\boxed" in model_answer:
             model_answer = extract_answer(model_answer)
             if model_answer is None:
@@ -1024,6 +1023,9 @@ def r1_zero_reward_fn(response, ground_truth, fast=True):
             ground_truth = str(ground_truth)
         if isinstance(ground_truth, str):
             is_correct = grade(model_answer, ground_truth, fast)
+            model_answer_digits = re.findall(r'\d+', model_answer)
+            if model_answer_digits:
+                is_correct |= grade(model_answer_digits[0], ground_truth, fast)
         elif isinstance(ground_truth, list):
             is_correct = False
             for gt in ground_truth:

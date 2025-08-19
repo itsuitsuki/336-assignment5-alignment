@@ -43,3 +43,17 @@ def preprocess_gsm8k(
 def load_math():
     ds = load_dataset("DigitalLearningGmbH/MATH-lighteval", "default", streaming=False) # "train" and "test"
     return ds
+
+def extract_thinking(response):
+    # first extract Assistant: ...
+    assistant_response = response.split("Assistant:")[-1]
+    # then extract the reasoning/thinking process | around by <think> </think>
+    thinking = assistant_response.split("<think>")[-1].split("</think>")[0]
+    return thinking
+
+def extract_answer(response):
+    # first extract Assistant: ...
+    assistant_response = response.split("Assistant:")[-1]
+    # then extract the answer | around by <answer> </answer> 
+    answer = assistant_response.split("<answer>")[-1].split("</answer>")[0]
+    return answer

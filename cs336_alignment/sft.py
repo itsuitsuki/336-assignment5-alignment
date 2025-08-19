@@ -1,56 +1,30 @@
 from cs336_alignment.sft_utils import tokenize_prompt_and_output, get_response_log_probs, sft_microbatch_train_step, sft_microbatch_loss_wo_grad
-from cs336_alignment.data_utils import preprocess_gsm8k, load_math, load_gsm8k
+from cs336_alignment.data_utils import preprocess_gsm8k, load_math, load_gsm8k, extract_answer, extract_thinking
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from datasets import load_dataset
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
-from vllm import LLM, SamplingParams
-from unittest.mock import patch
+from vllm import SamplingParams
 import torch
-from transformers import PreTrainedModel, PreTrainedTokenizer, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb
 from tqdm import tqdm
-
-
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
-    """
-    Start the inference process, here we use vLLM to hold a model on
-    a GPU separate from the policy.
-    """
-    vllm_set_random_seed(seed)
-    # Monkeypatch from TRL:
-    # https://github.com/huggingface/trl/blob/22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py
-    # Patch vLLM to make sure we can
-    # (1) place the vLLM model on the desired device (world_size_patch) and
-    # (2) avoid a test that is not designed for our setting (profiling_patch).
-    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-    profiling_patch = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None
-    )
-    with world_size_patch, profiling_patch:
-        return LLM(
-            model=model_id,
-            device=device,
-            dtype=torch.bfloat16,
-            enable_prefix_caching=True,
-            gpu_memory_utilization=gpu_memory_utilization,
-        )
-        
-def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
-    """
-    Copied from https://github.com/huggingface/trl/blob/
-    22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py#L670.
-    """
-    state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
+from vllm_utils import init_vllm, load_policy_into_vllm_instance
 
 def sft_main(n_epochs=1, bs=128, eval_bs=128, lr=1e-5, grad_accumulation=1., eval_step=200, do_expert_iteration=False):
     """
     Main function to run the SFT process.
     """
     # Initialize wandb
-    wandb.init(project="cs336_alignment", name="sft_main")
+    wandb.init(project="cs336_alignment", name="sft_main",
+               config={
+                   "n_epochs": n_epochs,
+                   "bs": bs,
+                   "eval_bs": eval_bs,
+                   "lr": lr,
+                   "grad_accumulation": grad_accumulation,
+                   "eval_step": eval_step,
+                   "do_expert_iteration": do_expert_iteration
+               }
+    )
     # Setup wandb metrics
     wandb.define_metric("train_step")
     # the x‑axis for training
@@ -88,7 +62,6 @@ def sft_main(n_epochs=1, bs=128, eval_bs=128, lr=1e-5, grad_accumulation=1., eva
     )
     # try some model things and exit (for debug)
     load_policy_into_vllm_instance(policy_model, eval_model)
-    print("Policy model loaded into vLLM instance.")
 
     # train_dataset = load_math()["train"]
     # eval_dataset = load_math()["test"]
@@ -120,8 +93,6 @@ def sft_main(n_epochs=1, bs=128, eval_bs=128, lr=1e-5, grad_accumulation=1., eva
         train_dataset = filter_by_expert_iteration(train_dataset, eval_model, 
                                                    prompt=prompt, n_sample_responses=8, temperature=0.85, top_p=0.8,
                                                    reward_fn=r1_zero_reward_fn, bs=eval_bs)
-    policy_model.train()
-
     for epoch in range(n_epochs):
         print(f"Epoch {epoch+1}/{n_epochs}")
         print(f"Train dataset size: {len(train_dataset)}, Eval dataset size: {len(eval_dataset)}")
@@ -204,7 +175,7 @@ def sft_main(n_epochs=1, bs=128, eval_bs=128, lr=1e-5, grad_accumulation=1., eva
                 with torch.no_grad():
                     # for eval_batch in eval_dataset.batch(batch_size=eval_bs):
                     pbar = tqdm(eval_dataset.batch(batch_size=eval_bs), desc=f"Evaluating Epoch {epoch}")
-                    table = wandb.Table(columns=["question", "whole_generation", "thinking", "answer", "answer_reward", "all_reward"])
+                    # table = wandb.Table(columns=["question", "whole_generation", "thinking", "answer", "answer_reward", "all_reward"])
                     for eval_batch in pbar:
                         eval_problem_list = eval_batch["problem"]
                         eval_solution_list = eval_batch["solution"]
@@ -238,7 +209,7 @@ def sft_main(n_epochs=1, bs=128, eval_bs=128, lr=1e-5, grad_accumulation=1., eva
                             use_tqdm=False
                         )
                         answers = [gen.outputs[0].text for gen in generations]
-                        tmp_rewards = [r1_zero_reward_fn(answer, groundtruth) for answer, groundtruth in zip(answers, eval_solution_list)]
+                        tmp_rewards = [r1_zero_reward_fn(answer, groundtruth.split("<answer>")[-1].split("</answer>")[0]) for answer, groundtruth in zip(answers, eval_solution_list)]
                         # "reward"
                         eval_total += len(tmp_rewards)
                         eval_ans_true += sum(1 for r in tmp_rewards if r["answer_reward"] == 1)
@@ -251,18 +222,18 @@ def sft_main(n_epochs=1, bs=128, eval_bs=128, lr=1e-5, grad_accumulation=1., eva
                         
                         # Log generation as a wandb Table (stores text cleanly rather than printing to stdout)
                         
-                        table.add_data(
-                            eval_problem_list[0],
-                            eval_problem_list[0] + answers[0],
-                            extract_thinking(eval_problem_list[0] + answers[0]),
-                            extract_answer(eval_problem_list[0] + answers[0]),
-                            int(tmp_rewards[0]["answer_reward"]),
-                            int(tmp_rewards[0]["reward"]),
-                        )
-                    wandb.log({
-                        "eval/generations": table,
-                        "eval_step": eval_cnt,
-                    })
+                        # table.add_data(
+                        #     eval_problem_list[0],
+                        #     eval_problem_list[0] + answers[0],
+                        #     extract_thinking(eval_problem_list[0] + answers[0]),
+                        #     extract_answer(eval_problem_list[0] + answers[0]),
+                        #     int(tmp_rewards[0]["answer_reward"]),
+                        #     int(tmp_rewards[0]["reward"]),
+                        # )
+                    # wandb.log({
+                    #     "eval/generations": table,
+                    #     "eval_step": eval_cnt,
+                    # })
 
                 eval_ans_accuracy = eval_ans_true / eval_total
                 eval_all_accuracy = eval_all_true / eval_total
@@ -279,20 +250,6 @@ def sft_main(n_epochs=1, bs=128, eval_bs=128, lr=1e-5, grad_accumulation=1., eva
             train_dataset = filter_by_expert_iteration(train_dataset, eval_model, prompt, n_sample_responses=8, temperature=0.85, top_p=0.8, reward_fn=r1_zero_reward_fn, bs=eval_bs)
     # end eval model
     del eval_model
-    
-def extract_thinking(response):
-    # first extract Assistant: ...
-    assistant_response = response.split("Assistant:")[-1]
-    # then extract the reasoning/thinking process | around by <think> </think>
-    thinking = assistant_response.split("<think>")[-1].split("</think>")[0]
-    return thinking
-
-def extract_answer(response):
-    # first extract Assistant: ...
-    assistant_response = response.split("Assistant:")[-1]
-    # then extract the answer | around by <answer> </answer> 
-    answer = assistant_response.split("<answer>")[-1].split("</answer>")[0]
-    return answer
 
 def filter_by_expert_iteration(dataset, model, prompt: str, n_sample_responses=16, temperature=0.85, top_p=0.95, reward_fn=r1_zero_reward_fn, bs=32):
     new_dataset = []

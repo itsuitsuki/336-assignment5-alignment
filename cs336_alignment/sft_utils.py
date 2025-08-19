@@ -1,9 +1,6 @@
-import json
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer, PreTrainedModel
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
-import re
 
 def naive_load_model_and_tokenizer():
     # qwen 2.5 math 1.5b

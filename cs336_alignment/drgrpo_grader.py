@@ -1007,8 +1007,11 @@ def grade(model_answer: str, gt_answer: str, fast: bool = True):
 
 def r1_zero_reward_fn(response, ground_truth, fast=True):
     # We are strict about format to evaluate our models.
-    if ("</think> <answer>" in response or "</think>\n<answer>" in response) and "</answer>" in response:
-        model_answer = response.split("<answer>")[-1].replace("</answer>", "")
+    # only blank e.g. spaces and \n between </think> and <answer>
+    think_n_answer_in_response = (response.split("</think>")[-1].split("<answer>")[0]).strip() == ""
+    if think_n_answer_in_response and "</answer>" in response:
+        model_answer = response.split("<answer>")[-1].replace("</answer>", "").strip()
+        # breakpoint()
         if "\\boxed" in model_answer:
             model_answer = extract_answer(model_answer)
             if model_answer is None:

@@ -20,9 +20,9 @@ def rft_grpo_gsm8k(args):
                name=f"grpo_rft_gsm8k_{args.loss_type}",
                config=vars(args))
     wandb.define_metric("train_step") # microbatch step
-    wandb.define_metric("grpo_step")
+    wandb.define_metric("eval_step")
     wandb.define_metric("train/*", step_metric="train_step")
-    wandb.define_metric("eval/*", step_metric="grpo_step")
+    wandb.define_metric("eval/*", step_metric="eval_step")
     for key, value in vars(args).items():
         print(f"{key}: {value}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True, max_length=args.max_len)
@@ -122,18 +122,55 @@ def rft_grpo_gsm8k(args):
             print('='*50)
             print(f"GRPO Step {grpo_step} Before-training Accuracy: {raw_rewards.mean().item()}")
             for group_id in range(n_prompts_per_rollout_batch):
-                problem = problem_list[group_id]
-                reward_mean = metadata["mean"][group_id]
-                reward_std = metadata["std"][group_id]
                 print('='*50)
-                print(f"Group {group_id}\nProblem: {problem}\nMean: {reward_mean}, STD: {reward_std}")
+                # if adv is not all zero (reward is not all the same), record the effective indices
+                if metadata["std"][group_id] == 0:
+                    # FIXME: NOT DEBUGGED, DAPO RE-SAMPLING (DYNAMIC SAMPLING)
+                    for retry in range(args.n_dapo_resample_retries):
+                        print(f"Retry {retry + 1}/{args.n_dapo_resample_retries} for group {group_id}")
+                        # resample 1 prompt from the train dataset
+                        sample = train_dataset.shuffle(grpo_step).select([n_prompts_per_rollout_batch - 1 + group_id * args.n_dapo_resample_retries + retry])
+                        tmp_problem = sample["problem"]
+                        tmp_solution = sample["solution"]
+                        tmp_prompt_list = [prompt.format(question=tmp_problem[0])]
+                        tmp_gens = eval_model.generate(
+                            tmp_prompt_list,
+                            train_sampling_params,
+                            use_tqdm=False
+                        )
+                        tmp_gens = [gen.outputs[j].text for gen in tmp_gens for j in range(args.group_size)]
+                        tmp_adv, tmp_raw_rewards, tmp_metadata = compute_group_normalized_rewards(
+                            reward_fn=r1_zero_reward_fn,
+                            rollout_responses=tmp_gens,
+                            repeated_ground_truths=[tmp_solution[0]] * args.group_size,
+                            group_size=args.group_size,
+                            advantage_eps=1e-6,
+                            normalize_by_std=(not args.drgrpo)
+                        )
+                        if tmp_metadata["std"][0] != 0:
+                            # success, start to substitute
+                            problem_list[group_id] = tmp_problem[0]
+                            solution_list[group_id] = tmp_solution[0]
+                            prompt_list[group_id] = tmp_prompt_list[0]
+                            repeated_prbls[group_id * args.group_size : (group_id + 1) * args.group_size] = [tmp_problem[0]] * args.group_size
+                            repeated_grths[group_id * args.group_size : (group_id + 1) * args.group_size] = [tmp_solution[0]] * args.group_size
+                            generations[group_id * args.group_size : (group_id + 1) * args.group_size] = tmp_gens
+                            adv[group_id * args.group_size : (group_id + 1) * args.group_size] = tmp_adv
+                            raw_rewards[group_id * args.group_size : (group_id + 1) * args.group_size] = tmp_raw_rewards
+                            metadata["mean"][group_id] = tmp_metadata["mean"][0]
+                            metadata["std"][group_id] = tmp_metadata["std"][0]
+                            metadata["meta_rewards"][group_id * args.group_size : (group_id + 1) * args.group_size] = tmp_metadata["meta_rewards"]
+                            print(f"Group {group_id} Resampled Successfully")
+                            break
+                        else:
+                            print(f"Group {group_id} Resampling Failed")
+                if metadata["std"][group_id] != 0:
+                    effective_groups.append(group_id)
+                    effective_idxs.extend(list(range(group_id * args.group_size, (group_id + 1) * args.group_size)))
+                print(f"Group {group_id}\nProblem: {problem_list[group_id]}\nMean: {metadata['mean'][group_id]}, STD: {metadata['std'][group_id]}")
                 print(f"Rewards: {raw_rewards[group_id * args.group_size : (group_id + 1) * args.group_size].tolist()}")
                 print(f"Format Rewards: {[fr['format_reward'] for fr in metadata['meta_rewards'][group_id * args.group_size : (group_id + 1) * args.group_size]]}")
                 print(f"Advantage: {adv[group_id * args.group_size : (group_id + 1) * args.group_size].tolist()}")
-                # if adv is not all zero (reward is not all the same), record the effective indices
-                if reward_std != 0:
-                    effective_groups.append(group_id)
-                    effective_idxs.extend(list(range(group_id * args.group_size, (group_id + 1) * args.group_size)))
         # training!
         print('='*50)
         if effective_groups:
@@ -158,7 +195,7 @@ def rft_grpo_gsm8k(args):
             old_log_probs = torch.zeros_like(ids[:, 1:], dtype=torch.float32).to(device_policy)
             # is_clipped = torch.zeros_like(ids[:, 1:], dtype=torch.float32).to(device_policy)
             print('='*50)
-            for microbatch_step in tqdm(range(n_microbatches_per_rollout_batch), desc=f"Microbatch Steps in iteration {iteration}"):
+            for microbatch_step in tqdm(range(n_microbatches_per_rollout_batch), desc=f"Microbatch Steps in iteration {iteration}, GRPO Step {grpo_step}"):
                 # if no idxs are in effective_idxs, continue
                 if set(effective_idxs).isdisjoint(set(range(microbatch_step * micro_train_batch_size, (microbatch_step + 1) * micro_train_batch_size))):
                     cnt += 1
@@ -184,8 +221,6 @@ def rft_grpo_gsm8k(args):
                 tmp_ids = ids[
                             microbatch_step * micro_train_batch_size : (microbatch_step + 1) * micro_train_batch_size
                         ].to(device_policy)
-                
-                
                 logits = policy_model.forward(tmp_ids, output_hidden_states=False).logits # (bs, seqlen+1, vocab_size)
                 logits = logits[:, :-1, :] # (bs, seqlen, vocab_size)
                 tmp_ids = tmp_ids[:, 1:]
@@ -220,7 +255,8 @@ def rft_grpo_gsm8k(args):
                         microbatch_step * micro_train_batch_size : (microbatch_step + 1) * micro_train_batch_size
                     ],
                     old_log_probs=old_log_probs_micro,
-                    cliprange=args.cliprange
+                    cliprange=args.cliprange,
+                    normalize_method=args.loss_normalize_method,
                 )
                 cnt += 1
                 orig_grad_norm = torch.nn.utils.clip_grad_norm_(policy_model.parameters(), max_norm=1.0)
@@ -322,6 +358,8 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=64)
     parser.add_argument("--cliprange", type=float, default=0.2, help="clipping range for grpo_clip")
     parser.add_argument("--drgrpo", type=bool, default=False, help="whether to use dynamic rollout for grpo i.e. not to use normalizing by std")
+    parser.add_argument("--loss_normalize_method", type=str, default="divide_unmasked_len", choices=["divide_unmasked_len", "divide_max_len"], help="method for normalizing loss")
+    parser.add_argument("--n_dapo_resample_retries", type=int, default=3, help="number of retries for DAPO resampling")
     args = parser.parse_args()
     seed_everything(args.seed)
     rft_grpo_gsm8k(args)

@@ -43,8 +43,8 @@ def compute_group_normalized_rewards(
     return advantage.view(-1), rewards.view(-1), {
         "mean": rewards.mean(1).tolist(),
         "std": rewards.std(1).tolist(),
-        "max": rewards.max(1).values.tolist(),
-        "min": rewards.min(1).values.tolist(),
+        # "max": rewards.max(1).values.tolist(),
+        # "min": rewards.min(1).values.tolist(),
         "meta_rewards": meta_rewards,
     }
     
@@ -168,6 +168,7 @@ def grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    normalize_method: Callable | str = "divide_unmasked_len",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Execute a forward-and-backward pass on a microbatch.
@@ -190,12 +191,18 @@ def grpo_microbatch_train_step(
             loss (torch.Tensor): Shape (batch_size, sequence_length), per-token loss.
             metadata (dict[str, torch.Tensor]): dict, statistics from the underlying routine (e.g., clip fraction for GRPO-Clip).
     """
+    if isinstance(normalize_method, str):
+        assert normalize_method in ["divide_unmasked_len", "divide_max_len"]
     old_log_probs = old_log_probs.detach() # stop grad
-    loss, metadata = compute_policy_gradient_loss(
+    per_token_loss, metadata = compute_policy_gradient_loss(
         policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange
     )
-    
-    loss = masked_mean(loss, response_mask) / gradient_accumulation_steps
+    if normalize_method == "divide_unmasked_len":
+        loss = masked_mean(per_token_loss, response_mask) / gradient_accumulation_steps
+    else:
+        from cs336_alignment.sft_utils import masked_normalize
+        # divide max len
+        loss = masked_normalize(per_token_loss, response_mask, normalize_constant=policy_log_probs.shape[1]) / gradient_accumulation_steps
     loss.backward()
     metadata["policy_log_probs_grad"] = policy_log_probs.retain_grad()
     return loss, metadata

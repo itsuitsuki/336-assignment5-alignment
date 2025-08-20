@@ -17,7 +17,7 @@ def seed_everything(seed):
 
 def rft_grpo_gsm8k(args):
     wandb.init(project="cs336_alignment", 
-               name=f"grpo_rft_gsm8k_{args.loss_type}",
+               name=f"grpo_rft_gsm8k_{args.loss_type}_{args.loss_normalize_method}",
                config=vars(args))
     wandb.define_metric("train_step") # microbatch step
     wandb.define_metric("eval_step")
@@ -358,8 +358,8 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=64)
     parser.add_argument("--cliprange", type=float, default=0.2, help="clipping range for grpo_clip")
     parser.add_argument("--drgrpo", type=bool, default=False, help="whether to use dynamic rollout for grpo i.e. not to use normalizing by std")
-    parser.add_argument("--loss_normalize_method", type=str, default="divide_unmasked_len", choices=["divide_unmasked_len", "divide_max_len"], help="method for normalizing loss")
-    parser.add_argument("--n_dapo_resample_retries", type=int, default=3, help="number of retries for DAPO resampling")
+    parser.add_argument("--loss_normalize_method", type=str, default="divide_max_len", choices=["divide_unmasked_len", "divide_max_len"], help="method for normalizing loss")
+    parser.add_argument("--n_dapo_resample_retries", type=int, default=0, help="number of retries for DAPO resampling")
     args = parser.parse_args()
     seed_everything(args.seed)
     rft_grpo_gsm8k(args)

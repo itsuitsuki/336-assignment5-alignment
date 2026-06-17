@@ -1,6 +1,9 @@
 from typing import Callable, Literal
 import torch
 import torch.nn as nn
+from transformers import PreTrainedTokenizerBase
+
+_alpaca_prompt = open("cs336_alignment/prompts/alpaca_sft.prompt").read()
 
 def compute_group_normalized_rewards(
     reward_fn: Callable[[str, str], dict[str, float]],
@@ -206,3 +209,61 @@ def grpo_microbatch_train_step(
     loss.backward()
     metadata["policy_log_probs_grad"] = policy_log_probs.retain_grad()
     return loss, metadata
+
+def compute_per_instance_dpo_loss(
+    lm: torch.nn.Module,
+    lm_ref: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    beta: float,
+    prompt: str,
+    response_chosen: str,
+    response_rejected: str,
+) -> torch.Tensor:
+    """
+    Given two language models (`lm`, and the "reference model" `lm_ref`),
+    their tokenizer, the DPO beta hyperparameter, a prompt and a pair
+    of responses to the prompt, computes the value of the DPO loss for this example.
+
+    lm: torch.nn.Module
+        Language model being trained.
+    lm_ref: torch.nn.Module
+        Reference language model.
+    tokenizer: PreTrainedTokenizerBase
+        Tokenizer for both language models.
+    beta: float
+        DPO beta hyperparameter.
+    prompt: str
+        Prompt for this instance of preference pair.
+    response_chosen: str
+        Preferred response to the prompt.
+    response_rejected: str
+        Rejected response to the prompt.
+
+    Returns:
+        torch.Tensor with the DPO loss for this example.
+    """
+    # alpaca sft
+    # prompts/
+    chosen = _alpaca_prompt.strip().format(instruction=prompt, response=response_chosen) + tokenizer.eos_token
+    rejected = _alpaca_prompt.strip().format(instruction=prompt, response=response_rejected) + tokenizer.eos_token
+    chosen_ids = tokenizer(chosen, return_tensors="pt", add_special_tokens=False).input_ids.to(next(lm.parameters()).device)
+    rejected_ids = tokenizer(rejected, return_tensors="pt", add_special_tokens=False).input_ids.to(next(lm.parameters()).device)
+    # print(chosen_ids)
+    # print(rejected_ids)
+    with torch.no_grad():
+        # logits: [bs, seqlen, vocab]
+        ref_chosen = lm_ref(chosen_ids).logits[:, :-1, :].log_softmax(dim=-1).detach()
+        ref_rej = lm_ref(rejected_ids).logits[:, :-1, :].log_softmax(dim=-1).detach()
+        # gather
+        ref_chosen = torch.gather(ref_chosen, 2, chosen_ids[:, 1:].unsqueeze(-1)).squeeze(-1).sum(-1)
+        ref_rej = torch.gather(ref_rej, 2, rejected_ids[:, 1:].unsqueeze(-1)).squeeze(-1).sum(-1)
+        ref_diff = ref_chosen - ref_rej
+    # with grad
+    lm_chosen = lm(chosen_ids).logits[:, :-1, :].log_softmax(dim=-1)
+    lm_rej = lm(rejected_ids).logits[:, :-1, :].log_softmax(dim=-1)
+    lm_chosen = torch.gather(lm_chosen, 2, chosen_ids[:, 1:].unsqueeze(-1)).squeeze(-1).sum(-1)
+    lm_rej = torch.gather(lm_rej, 2, rejected_ids[:, 1:].unsqueeze(-1)).squeeze(-1).sum(-1)
+    lm_diff = lm_chosen - lm_rej
+    raw = beta * (lm_diff - ref_diff)
+    loss = -torch.nn.functional.logsigmoid(raw).squeeze()
+    return loss

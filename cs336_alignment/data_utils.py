@@ -1,5 +1,6 @@
 import json
 import re 
+from typing import Any
 from datasets import load_dataset
 
 def load_gsm8k(split):
@@ -57,3 +58,32 @@ def extract_answer(response):
     # then extract the answer | around by <answer> </answer> 
     answer = assistant_response.split("<answer>")[-1].split("</answer>")[0]
     return answer
+
+def parse_mmlu_response(
+    mmlu_example: dict[str, Any],
+    model_output: str,
+) -> str | None:
+    # model output: "The correct answer is A" -> "A"
+    match = re.search(r"The correct answer is (.)", model_output)
+    if match:
+        letter = match.group(1)
+        if letter not in ["A", "B", "C", "D"]:
+            return None
+        return letter
+    # find the first in [ABCD]
+    match = re.search(r"\b([ABCD])\b", model_output) # 単語区切り位置：スペースまたは句読点
+    if match:
+        letter = match.group(1)
+        if letter not in ["A", "B", "C", "D"]:
+            return None
+        return letter
+    return None
+
+def parse_gsm8k_response(
+    model_output: str,
+) -> str | None:
+    # find the last numerical thing
+    match = re.findall(r"\b[-+]?(?:\d*\.\d+|\d+)\b", model_output)
+    if match:
+        return match[-1]
+    return None
